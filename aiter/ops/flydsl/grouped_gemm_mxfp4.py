@@ -27,6 +27,18 @@ def _select_bool_env(name: str, csv_value: int) -> int:
     return int(value)
 
 
+def _a_gather_mode(a_row_index, a_index_bound) -> int:
+    """Kernel ``a_gather`` bits: 1/2 = 32/16-bit indices, 4 = resident A-scale."""
+    if a_row_index is None:
+        return 0
+    # 16-bit indices halve the gather op count and need every valid row id to
+    # fit. At a bound of exactly 0x10000 (4 ranks x 16k tokens, the e2e arena)
+    # a negative padding id wraps to the in-bounds row 0xFFFF instead of OOB;
+    # padding rows are dropped by GEMM2's scatter, so their contents are moot.
+    idx16 = 0 < int(a_index_bound) <= 0x10000
+    return (2 if idx16 else 1) | 4
+
+
 def _select_tdm_b_th(csv_tdm_b_th: int) -> int:
     """Selects the B-only TDM temporal hint."""
     value = os.environ.get("AITER_TDM_B_TH")
@@ -142,6 +154,10 @@ def flydsl_grouped_gemm_a8w4_masked(
     persistent_workers=0,
     rolled_drain=0,
     m_align=0,
+    a_row_index=None,
+    a_index_bound=0,
+    a_index_stride=1,
+    a_index_divisor=1,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
 
@@ -207,6 +223,15 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
+    a_gather = _a_gather_mode(a_row_index, a_index_bound)
+    if a_gather & 4:
+        # A resident full-K A-scale beats one more stage of the per-K-tile
+        # scale row gather (t256 decode, 1536 tok: 562 -> 513 us/layer at b3).
+        # Approximate stage bytes; the kernel still drops residency if short.
+        as_resident_b = tile_m * (K // 32) * 9 // 8
+        stage_b = (tile_m + tile_n) * (tile_k // 2 + tile_k // 32)
+        while num_buffers > 2 and num_buffers * stage_b + as_resident_b > 320 * 1024:
+            num_buffers -= 1
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -263,5 +288,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         persistent_workers=persistent_workers,
         rolled_drain=rolled_drain,
         m_align=int(m_align),
+        arg_a_row_index=ptr_arg(a_row_index if a_row_index is not None else a),
+        i32_a_index_bound=int(a_index_bound),
+        i32_a_index_stride=int(a_index_stride),
+        i32_a_index_divisor=int(a_index_divisor),
+        a_gather=a_gather,
     )
     return out
